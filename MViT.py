@@ -1,13 +1,17 @@
+import inspect
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from einops import rearrange
 import torch.nn.functional as F
+from timm.layers import trunc_normal_, DropPath
 
 @dataclass
 class MViTConfig:
     pooling_func = 'max' # 'max' or 'conv'
-    dropout = 0.0
+    dropout = 0.0 # att dropout, not used currently
+    dropout_final_layer = 0.5
+    drop_path_rate = 0.2
     n_layer = [1, 2, 11, 2]
     channel_size = [96, 192, 384, 768]
     head_size = 96 # constant throughout the network
@@ -38,7 +42,7 @@ class MViTConfig:
 
 
 class MHPA(nn.Module):
-    def __init__(self, config: MViTConfig, stage, downsample = False):
+    def __init__(self, config: MViTConfig, stage, drop_path, downsample = False):
         # downample: space time down sampling given stride (1, 2, 2)
         super().__init__()
 
@@ -115,10 +119,13 @@ class MHPA(nn.Module):
         self.dropout = config.dropout
 
         self.c_proj = nn.Linear(channel_size, channel_size)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        # self.resid_dropout = nn.Dropout(config.dropout)
+
+        # stochastic depth
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
         self.channel_size = channel_size
-                
+        
 
     def forward(self, x):
         # cls_token: (B, 1, D)
@@ -162,7 +169,7 @@ class MHPA(nn.Module):
         # attention!
         y = F.scaled_dot_product_attention(q, k, v,  dropout_p=self.dropout if self.training else 0) # (B, nh, L+1, hs)
         y = rearrange(y, 'b nh l hs -> b l (nh hs)') # (B, L+1, D)
-        y = self.resid_dropout(self.c_proj(y))  # (B, L+1, D) or  # (B, L/4+1, D)
+        y = self.drop_path(self.c_proj(y))  # (B, L+1, D) or  # (B, L/4+1, D)
 
         if self.downsample:
             cls_token, x = x.split([1, L], dim=1) # (B, 1, D), (B, L, D)
@@ -177,7 +184,7 @@ class MHPA(nn.Module):
     
 
 class MLP(nn.Module):
-    def __init__(self, config: MViTConfig, stage, upsample = False):
+    def __init__(self, config: MViTConfig, stage, drop_path, upsample = False):
         # upsample channel dim by x2
         super().__init__()
         channel_size = config.channel_size[stage]
@@ -193,7 +200,8 @@ class MLP(nn.Module):
             self.c_proj = nn.Linear(4 * channel_size, channel_size)
             self.resid_proj = nn.Identity()
 
-        self.dropout = nn.Dropout(config.dropout)
+        # self.dropout = nn.Dropout(config.dropout)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
 
     def forward(self, x):
@@ -203,17 +211,17 @@ class MLP(nn.Module):
         y = self.c_fc(x_normalized)
         y = self.gelu(y)
         y = self.c_proj(y)
-        y = self.dropout(y)
+        y = self.drop_path(y)
 
         res_input = x_normalized if self.upsample else x
         return self.resid_proj(res_input) + y # (B, L+1, D) or (B, L+1, 2D)
     
 
 class Block(nn.Module):
-    def __init__(self, config: MViTConfig, stage, downsample = False, upsample = False):
+    def __init__(self, config: MViTConfig, stage, dp_rate, downsample = False, upsample = False):
         super().__init__()
-        self.mhpa = MHPA(config, stage, downsample)
-        self.mlp = MLP(config, stage, upsample)
+        self.mhpa = MHPA(config, stage, dp_rate, downsample)
+        self.mlp = MLP(config, stage, dp_rate, upsample)
 
     def forward(self, x):
         x = self.mhpa(x) # (B, L+1, D) or  # (B, L/4+1, D)
@@ -241,9 +249,15 @@ class MViT(nn.Module):
         self.time_embd = nn.Embedding(num_embeddings=self.time_dim, embedding_dim=initial_channel_size)
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, initial_channel_size))
+        trunc_normal_(self.cls_token, std=0.02)
+
+        # drop path rates
+        dp_rates = [x.item() for x in torch.linspace(0, config.drop_path_rate, sum(config.n_layer))]
 
         self.blocks = nn.ModuleList()
         last_stage = len(config.n_layer) - 1
+        dp_rate_idx = 0
+
         for stage, num_layers in enumerate(config.n_layer):
             for j in range(num_layers):
                 # the first block of every stage (except stage 0) is a space-time downsample block
@@ -251,13 +265,31 @@ class MViT(nn.Module):
 
                 # the last block of everg stage (except stage 3, the last stage) is a channel upsample block
                 upsample = (stage < last_stage and j == num_layers-1)
+
+                dp_rate = dp_rates[dp_rate_idx]
+                dp_rate_idx += 1
                 
                 self.blocks.append(
-                    Block(config, stage, downsample, upsample)
+                    Block(config, stage, dp_rate, downsample, upsample)
                 )
 
+        self.final_dropout = nn.Dropout(config.dropout_final_layer)
         self.ln_final = nn.LayerNorm(config.channel_size[-1])
         self.head = nn.Linear(config.channel_size[-1], 400)
+
+        self.apply(self._init_weights)
+
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Conv3d, nn.Linear)):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding): # nn.Embedding don't have bias
+            trunc_normal_(module.weight, std=0.02)
+        elif isinstance(module, nn.LayerNorm): # this is redundant but just to be explicit
+            nn.init.zeros_(module.bias)
+            nn.init.ones_(module.weight) 
 
 
     def forward(self, x):
@@ -294,6 +326,7 @@ class MViT(nn.Module):
         for block in self.blocks:
             x = block(x)
 
+        x = self.final_dropout(x)
         # extract cls token embedding
         x = x[:, 0] # (B, D)
 
@@ -304,3 +337,24 @@ class MViT(nn.Module):
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+
+    def configure_optimizers(self, weight_decay, learning_rate):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, fused=fused_available)
+        print(f"using fused AdamW: {fused_available}")
+
+        return optimizer

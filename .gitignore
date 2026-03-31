@@ -1,0 +1,7 @@
+# OSX folder attributes
+.DS_Store
+.AppleDouble
+.LSOverride
+__pycache__/
+*.pyc
+.vscode/
