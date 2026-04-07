@@ -6,6 +6,8 @@ from einops import rearrange
 import torch.nn.functional as F
 from timm.layers import trunc_normal_, DropPath
 
+from torch._dynamo import disable
+
 @dataclass
 class MViTConfig:
     pooling_func = 'max' # 'max' or 'conv'
@@ -125,7 +127,18 @@ class MHPA(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
         self.channel_size = channel_size
-        
+
+
+    @disable
+    def _post_pool_rearrange(self, q, k, v):
+        # this is a reshape + permute + reshape operation, it messes up the computation graph
+        # and torch compile complains regardless of using einops or not. So we have to disable
+        # compilation just for those operations. 
+        q = rearrange(q, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs)
+        k = rearrange(k, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs)
+        v = rearrange(v, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs)
+        return q, k, v
+
 
     def forward(self, x):
         # cls_token: (B, 1, D)
@@ -152,17 +165,17 @@ class MHPA(nn.Module):
 
         # poolings, reshape, and concatenate
         q = self.pool_Q(q) # (B, D, T, H, W) or (B, D, T, H/2, W/2)
-        q = rearrange(q, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs) # (B, nh, L, hs) or (B, nh, L/4, hs)
+        k = self.pool_K(k) # (B, D, T, H/8, W/8)
+        v = self.pool_V(v) # (B, D, T, H/8, W/8)
+
+        q, k, v = self._post_pool_rearrange(q, k, v) # (B, nh, L, hs) or (B, nh, L/4, hs), (B, nh, L/64, hs)
+
         q = self.ln_Q(q) # (B, nh, L, hs)
         q = torch.cat((q_cls, q), dim=2) # (B, nh, L+1, hs)
 
-        k = self.pool_K(k) # (B, D, T, H/8, W/8)
-        k = rearrange(k, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs) # (B, nh, L/64, hs)
         k = self.ln_K(k) # (B, nh, L/64, hs)
         k = torch.cat((k_cls, k), dim=2) # (B, nh, L/64+1, hs)
 
-        v = self.pool_V(v) # (B, D, T, H/8, W/8)
-        v = rearrange(v, 'b (nh hs) t h w -> b nh (t h w) hs', hs=self.hs) # (B, nh, L/64, hs)
         v = self.ln_V(v) # (B, nh, L/64, hs)
         v = torch.cat((v_cls, v), dim=2) # (B, nh, L/64+1, hs)
 

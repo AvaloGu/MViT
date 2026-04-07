@@ -5,3 +5,5 @@
 __pycache__/
 *.pyc
 .vscode/
+k400/
+k400_targz/

@@ -1,8 +1,9 @@
+import os
 import pandas as pd
 import torch
 from torchvision import tv_tensors
 from torch.utils.data import Dataset, DataLoader
-from torchvision.io import read_video
+# from torchvision.io import read_video
 from torchvision.transforms import v2
 import random
 from vocab import STOI
@@ -12,8 +13,6 @@ from vocab import STOI
 # 300 frames clip while we only need to grab 16 frames
 from torchcodec.decoders import VideoDecoder
 from torchcodec.transforms import Resize 
-
-
 
 # clip level spatial transformation
 clip_spatial_transform = v2.Compose([
@@ -53,6 +52,8 @@ clip_spatial_transform = v2.Compose([
 
 
 clip_transform_eval = v2.Compose([
+    v2.Resize(size=(224, 224)), 
+
     # convert to float32 and rescale to [0.0, 1.0].
     v2.ToDtype(torch.float32, scale=True),
 
@@ -118,18 +119,19 @@ class KineticsCSVDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # video_path = os.path.join(self.video_dir, row[0])
         video_path = row['path']
+        video_path = os.path.join(self.video_dir, video_path)
         label = row['label']
 
         label = STOI[label]
 
         # initialize the video decoder
-        # make sure its version 0.10, so it has the transforms argument
-        # actually we'll not downsample for two reasons
-        # 1. We don't want to alter the aspect ratio before our data augmentation step
-        # 2. The possible random crop of 8% will result in blurriness (and upsamling back to 224x224) with big downsample
-        vid_decoder = VideoDecoder(video_path) # transforms=[Resize(size=(720, 720))])
+        # make sure its version 0.10+, so it has the transforms argument
+        # we'll downsample or upsample to 640x640
+        # 1. This might alter the aspect ratio before our data augmentation step
+        # 2. The possible random crop of 8% will result in blurriness (and upsamling back to 224x224) 
+        # with big downsample, so we chose a resolution of 640x640 to be moderate.
+        vid_decoder = VideoDecoder(video_path, transforms=[Resize(size=(640, 640))])
 
         # temporal sampling
         # Kinetics should be mostly 10 seconds video, 30 fps, so 300 frames per clip
@@ -151,7 +153,6 @@ class KineticsCSVDataset(Dataset):
             target_indices = torch.arange(starting_idx, starting_idx + clip_length, step=self.temporal_stride)
 
         # fast seek and decode, we only fetch the frames we need
-        # returns a tensor of shape (frames_per_clip, H, W, C)
         # video: (T, C, H, W), uint8, which match v2 and tv_tensor's expectation
         torchcodec_frames = vid_decoder.get_frames_at(target_indices)
         video = torchcodec_frames.data
@@ -168,7 +169,19 @@ def get_loader(csv_path, video_dir, batch_size=64, num_workers=12):
                         shuffle=True,
                         num_workers=num_workers,
                         prefetch_factor=4, # each worker keeps 4 batches ready so GPU don't wait
-                        pin_memory=True)
+                        pin_memory=True) # locked in RAM, instead of Pageable (OS can move it around), this way GPU can use direct memory acess, faster
     return loader
+
+def clip_spatial_aug(x, y):
+    x = tv_tensors.Video(x)
+
+    # 2 repeated augmentation reptitions
+    x1  = clip_spatial_transform(x) # augment on gpu
+    x2  = clip_spatial_transform(x) # augment on gpu
+    x = torch.cat([x1, x2], dim=0)   # (2B, T, C, H, W)
+    y = torch.cat([y, y], dim=0)     # (2B,)
+
+    return x, y
+
     
     
