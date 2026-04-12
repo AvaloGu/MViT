@@ -5,11 +5,14 @@ import nvidia.dali.types as types
 from nvidia.dali import pipeline_def
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from nvidia.dali.auto_aug import rand_augment
+from nvidia.dali import math as dali_math
 from vocab import STOI 
 
 import torch
 from torchvision import tv_tensors
 from torchvision.transforms import v2
+
+import glob
 
 # DALI utilizes NVDEC (NVIDIA's hardware decoder) to read, decode, and sample the videos 
 # directly on the GPU, completely bypassing the CPU overhead.
@@ -69,76 +72,97 @@ def apply_augmentations(video):
 
     return video
 
-
-# one issue with fn.readers.video is it will aggregate and put all possible (16 frames 
-# stride 4) non-overlapping sequences in a bucket, shuffle it if random_shuffle, 
-# and draw from that bucket. So we can get multiple examples from the same
-# video clip and the epoch size will be a lot larger than what we expect.
-# This won't match the kinetics epoch logic by itself.
-
-# the argument 'step' defaults to the temporal span of the clip (in our case, 16×4=64 frames). 
-# For a standard 10-second, 300-frame Kinetics video, DALI will automatically extract ~4 sequential, 
-# non-overlapping clips per video. random_shuffle=True just tosses all of these generated clips into 
-# a shuffle bucket. This will make a single epoch 4x larger.
+# A DALI pipeline is basically a declarative computation graph. Instead of executing operations immediately, you describe a 
+# data-processing workflow as a graph of nodes (DataNodes) connected by operators. Each node represents a tensor flowing through 
+# the pipeline, and each fn.* call adds an operation (decode, resize, etc.) to that graph rather than running it right away. 
+# When you call pipe.run(), DALI compiles and executes the whole graph efficiently—pipelining CPU/GPU work, parallelizing operations, 
+# and prefetching data so it keeps the training loop fast.
+# Every fn.* operation outputs a DataNode, which represents a TensorList in the pipeline graph (one tensor per sample in the batch)
+# In other words, a DataNode doesn’t hold one tensor, it holds a whole batch. In DALI, a TensorList is basically a list of tensors, 
+# one per sample in the batch, so if your batch size is 32, that DataNode represents 32 tensors flowing together through the graph. 
+# Every operation (fn.*) processes the entire batch at once, and outputs another batch-shaped TensorList.
 
 # this flag allows you to use functional control flow (like if statements and else blocks) directly 
 # inside the GPU-accelerated data pipeline, enabling you to apply certain transformations 
 # (like RandAugment and Random Erasing)
 @pipeline_def(enable_conditionals=True) # pipeline_def decorator automatically injects batch_size, num_threads, and device_id as required keyword arguments for the pipeline
-def kinetics_video_pipeline(filenames, labels, sequence_length=16, temporal_stride=4):
-    # video reader & decoder (executes entirely on GPU), (T, H, W, C)
-    video, label = fn.readers.video(
-        device="gpu",
-        filenames=filenames,
-        labels=labels,
-        sequence_length=sequence_length,
-        stride=temporal_stride,
+def kinetics_webdataset_pipeline(tar_files, index_files, sequence_length=16, temporal_stride=4):
+    # read from WebDataset
+    # DALI extracts the specific extensions into separate variables
+    video_bytes, label_bytes, nframes_bytes = fn.readers.webdataset(
+        paths=tar_files,
+        index_paths=index_files,
+        ext=["mp4", "lbl", "nframes"],
         random_shuffle=True,
-        initial_fill = 256, # size of the buffer that is used for shuffling, pre-loads this many sequences into a buffer before shuffling begins, larger values gives better randomness but more memory
-        pad_sequences=True, # if the video is shorter than the required clip length, it will pad by 0
+        initial_fill=256,
         name="loader"
     )
 
-    # 2 repeated augmentation reptitions
+    num_frames = fn.reinterpret(nframes_bytes, dtype=types.INT64, shape=[1])
+
+    clip_length = sequence_length * temporal_stride # 64
+    clip_len_tensor = fn.constant(idata=clip_length, dtype=types.INT64, device="cpu")
+
+    max_start = dali_math.max(num_frames - clip_len_tensor, 0)
+
+    # temporal sampling
+    temp_rand_ratio = fn.random.uniform(range=[0.0, 1.0])
+    start_frame = fn.cast(
+        temp_rand_ratio * fn.cast(max_start, dtype=types.FLOAT),
+        dtype=types.INT64
+    )
+
+    # Decode the video dynamically using NVDEC
+    # device="mixed" means the CPU handles the byte-stream, but the GPU handles the decoding
+    video = fn.decoders.video(
+        video_bytes,
+        device="mixed", 
+        sequence_length=sequence_length,
+        stride=temporal_stride,
+        pad_mode='repeat', # Repeat the last valid frame for padding
+        start_frame=start_frame,
+    )
+    
+    # parse the label back to an INT32 tensor
+    # fn.reinterpret casts the raw bytes we packed in Step 1 back into numbers
+    label = fn.reinterpret(label_bytes, dtype=types.INT64, shape=[1])
+
+    # apply GPU augmentations, 2 repeated augmentation repetition
     aug1 = apply_augmentations(video)
     aug2 = apply_augmentations(video)
 
     return aug1, aug2, label
 
 
-def create_dali_loader(filenames, labels, batch_size, num_threads, device_id=0):
-    # instantiate the loading pipeline
-    pipe = kinetics_video_pipeline(
-        filenames=filenames,
-        labels=labels,
-        batch_size=batch_size,
-        num_threads=num_threads, # controls the size of the CPU thread pool dedicated to this pipeline, DALI still uses CPU threads for orchestrating instructions, try 4-8
-        device_id=device_id, # index of the GPU
-        prefetch_queue_depth={"cpu_size": 8, "gpu_size": 8} #  pipeline to use separated queues executor, with buffer queue size 4 for cpu stage and 8 for mixed and gpu stages
-    )
-    # our setting for prefetch_queue_depth allows the CPU stage to buffer its results independently of the GPU stage, 
-    # which is more effective at hiding the spiky stats. 
+def create_dali_loader(webdataset_dir, batch_size, num_threads, device_id=0):
+    # gather the generated .tar and .idx files
+    tar_files = sorted(glob.glob(os.path.join(webdataset_dir, "*.tar"))) # glob.glob returns a list of file paths matching the specified pattern
+    index_files = sorted(glob.glob(os.path.join(webdataset_dir, "*.idx"))) # glob is used for pattern matching on file paths
     
-    # build the graph
+    assert len(tar_files) > 0, "No .tar files found!"
+    assert len(tar_files) == len(index_files), "Mismatch between .tar and .idx files!"
+
+    # Instantiate the WebDataset pipeline
+    pipe = kinetics_webdataset_pipeline(
+        tar_files=tar_files,
+        index_files=index_files,
+        batch_size=batch_size,
+        num_threads=num_threads, 
+        device_id=device_id,
+        prefetch_queue_depth={"cpu_size": 4, "gpu_size": 8}
+    )
+    
     pipe.build()
 
-    # wrap in PyTorch Iterator
+    # Wrap in PyTorch Iterator
     dali_loader = DALIGenericIterator(
         pipe,
-        output_map=["aug1", "aug2", "label"], # output_map must match the order of variables returned in @pipeline_def
-        reader_name="loader", # reader_name="loader" syncs the iterator's epoch size with fn.readers.video
-        auto_reset=True # automatically reset the iterator at the end of an epoch
+        output_map=["aug1", "aug2", "label"],
+        reader_name="loader",
+        auto_reset=True
     )
     
     return dali_loader
-
-
-def build_file_lists(csv_path, video_dir):
-    # DALI needs a list of absolute paths and integer labels
-    df = pd.read_csv(csv_path)
-    paths  = [os.path.join(video_dir, p) for p in df['path']]
-    labels = [STOI[l] for l in df['label']]
-    return paths, labels
 
 
 class MixupCutmixAugmentation:
@@ -176,16 +200,5 @@ class MixupCutmixAugmentation:
         mixed_labels = torch.cat([labels_m, labels_c], dim=0)
         
         return mixed_videos, mixed_labels # (B, T, C, H, W), (B, num_classes)
-
-
-# Assuming dali_loader is created
-# for i, data in enumerate(dali_loader):
-#     # DALI outputs a list of dicts. If single GPU, grab index 0.
-#     batch = data[0]
-    
-#     # Extract tensors (already on GPU)
-#     v1 = batch["view1"] # Shape: (B, T, C, 224, 224)
-#     v2 = batch["view2"] # Shape: (B, T, C, 224, 224)
-#     y  = batch["label"].squeeze(-1) # Shape: (B,)
     
 

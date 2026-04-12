@@ -131,7 +131,7 @@ class KineticsCSVDataset(Dataset):
         # 1. This might alter the aspect ratio before our data augmentation step
         # 2. The possible random crop of 8% will result in blurriness (and upsamling back to 224x224) 
         # with big downsample, so we chose a resolution of 640x640 to be moderate.
-        vid_decoder = VideoDecoder(video_path, transforms=[Resize(size=(640, 640))])
+        vid_decoder = VideoDecoder(video_path)
 
         # temporal sampling
         # Kinetics should be mostly 10 seconds video, 30 fps, so 300 frames per clip
@@ -157,7 +157,16 @@ class KineticsCSVDataset(Dataset):
         torchcodec_frames = vid_decoder.get_frames_at(target_indices)
         video = torchcodec_frames.data
 
-        return video, label
+        # 2 repeated augmentation reptitions
+        # wrap the tensors as Video so v2 knows to treat the temporal dimension
+        video = tv_tensors.Video(video)
+        aug1 = clip_spatial_transform(video) # (T, C, H, W) float32
+        aug2 = clip_spatial_transform(video) # (T, C, H, W) float32
+        aug = torch.stack([aug1, aug2]) # (2, T, C, 224, 224)
+
+        # DataLoader to collate them into (B, 2, T, C, 224, 224)
+
+        return aug, label 
     
 # 112 cores / 8 distributed processes = 14,
 # so we'll launch 12 workers per process
@@ -168,26 +177,10 @@ def get_loader(csv_path, video_dir, batch_size=64, num_workers=12):
                         batch_size=batch_size, 
                         shuffle=True,
                         num_workers=num_workers,
-                        prefetch_factor=4, # each worker keeps 4 batches ready so GPU don't wait
-                        pin_memory=True) # locked in RAM, instead of Pageable (OS can move it around), this way GPU can use direct memory acess, faster
+                        # prefetch_factor=8, # each worker keeps 4 batches ready so GPU don't wait
+                        pin_memory=True, # locked in RAM, instead of Pageable (OS can move it around), this way GPU can use direct memory acess, faster
+                        persistent_workers=True) # by default, PyTorch kills all num_workers at the end of an epoch and restarts them for the next one, Keeps the engine running between epochs
     return loader
-
-def clip_spatial_aug(x, y):
-    x = tv_tensors.Video(x)
-
-    # 2 repeated augmentation reptitions
-    x1  = clip_spatial_transform(x) # augment on gpu
-    x2  = clip_spatial_transform(x) # augment on gpu
-    x = torch.cat([x1, x2], dim=0)   # (2B, T, C, H, W)
-    y = torch.cat([y, y], dim=0)     # (2B,)
-
-    # this is actually a bad idea since the augmentations are random per video, 
-    # PyTorch has to slice the batch into 64 individual GPU tensors under the hood.
-    # CPU generates random aug for clip 1, and for clip 2 and so on for 64 times.
-    # this chaotic slicing, dispatching, and recombining is generating hundreds of
-    # communication between CPU and GPU through PCIe bus
-
-    return x, y
 
     
     

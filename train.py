@@ -27,6 +27,8 @@ def train_one_epoch_with_profiler(model, loader, mixup_cutmix, optimizer, lr_sch
         profile_memory=True, # useful for checking VRAM usage, which layers or operations are consuming the most VRAM.
         with_stack=True # record the Python call stack for every single operator (e.g. conv2d, matmul) executed during the trace.
     ) as prof:
+        
+        # this is actaully not a super accurate profiling as the profiler itself eats away so much RAM and CPU time
 
         for i, (x, y) in enumerate(loader):
             # creates a clear block in the profiler output, distinguish data loading, augmentations, 
@@ -127,6 +129,8 @@ def train_one_epoch(model, loader, mixup_cutmix, optimizer, lr_scheduler, criter
         gpu_num = ray.train.get_context().get_world_rank()
         print(f'gpu: {gpu_num} | loss: {loss.item():.4f} | grad norm: {norm:.4f} | time elapsed: {dt}')
 
+    print(f'gpu: {gpu_num} | total iter: {total_iter}')
+
     avg_loss = total_train_loss / total_iter
     return avg_loss, norm
 
@@ -188,23 +192,23 @@ def train():
 
     bs = 16
     # configure optimizer after the model being moved to cuda so it has gpu version of the tensors 
-    optimizer = model.module.configure_optimizers(weight_decay=5e-2, learning_rate=1.6e-3*bs/512) # TODO
+    optimizer = model.configure_optimizers(weight_decay=5e-2, learning_rate=1.6e-3*bs/512) # TODO
 
     # good practice to compile last, so it sees the optimizer (and the model's final state) before 
     # freezing the graph representation. Especially we are setting up different weight decay on param 
     # groups in configure_optimizers
     # Can't wrap the Ray model in torch.compile, it becomes un pick-able (unserializable) which creates
     # an issue for Ray. Instead we'll just compile the MViT code while leaving the wrapper clean
-    model.module = torch.compile(model.module)
+    model = torch.compile(model) # TODO for dist processing
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_val = nn.CrossEntropyLoss()
 
     csv_path = "/blue/uf-dsi/rongguan.gu/MViT/val_mini.csv"
     video_dir = "/blue/uf-dsi/rongguan.gu/MViT/k400/val"
-    train_loader = get_loader(csv_path=csv_path, video_dir=video_dir, batch_size=4, num_workers=14) # TODO
+    train_loader = get_loader(csv_path=csv_path, video_dir=video_dir, batch_size=8, num_workers=14) # TODO
     #if ray.train.get_context().get_world_rank() == 0: # master process
-    val_loader = get_loader(csv_path=csv_path, video_dir=video_dir, batch_size=4, num_workers=14) # TODO
+    val_loader = get_loader(csv_path=csv_path, video_dir=video_dir, batch_size=8, num_workers=14) # TODO
     # prepare train_loader for distributed sampling
     # prepare_data_loader wrap the dataset in torch's DistributedSampler, which chunks up
     # the dataset for each card, + DataLoader. Equivalent to
@@ -308,7 +312,7 @@ if __name__ == "__main__":
      )
 
      scaling_config = ray.train.ScalingConfig( # TODO
-         num_workers=2, # one worker per GPU
+         num_workers=1, # one worker per GPU
          use_gpu=True, # training will be done on GPUs (1 GPU per worker by default)
          resources_per_worker={"CPU":14, "GPU":1}, # 14 CPU and 1 GPU per woker
      )
