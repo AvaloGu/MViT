@@ -6,13 +6,21 @@ from nvidia.dali import pipeline_def
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from nvidia.dali.auto_aug import rand_augment
 from nvidia.dali import math as dali_math
-from vocab import STOI 
+# from vocab import STOI 
 
 import torch
 from torchvision import tv_tensors
 from torchvision.transforms import v2
 
 import glob
+
+# using webdataset might not be a good idea
+# NVDEC cannot decode raw container bytes. Before the GPU can decode the video, DALI forces the CPU to use FFmpeg to demux the MP4 
+# container in memory, parse the headers, and extract the raw encoded packets. Parsing complex MP4 containers from a byte stream is a 
+# highly sequential, heavily CPU-bound process. The CPU simply cannot demux the frames fast enough. 
+# Demuxing (short for de-multiplexing) is the process of reading a media container file such as an MP4, and separating its combined data 
+# into individual elementary streams like video, audio, and subtitles. It acts as the first stage of media processing, extracting the encoded 
+# data packets from the file structure so they can be sent to their respective decoders for playback.
 
 # DALI utilizes NVDEC (NVIDIA's hardware decoder) to read, decode, and sample the videos 
 # directly on the GPU, completely bypassing the CPU overhead.
@@ -28,14 +36,14 @@ def apply_augmentations(video):
     )
 
     # random Horizontal Flip (p=0.5)
-    coin_flip = fn.random.coin_flip(probability=0.5)
-    video = fn.flip(video, horizontal=coin_flip)
+    # coin_flip = fn.random.coin_flip(probability=0.5)
+    # video = fn.flip(video, horizontal=coin_flip)
 
     # RandAugment (p=0.5, 4 layers, magnitude 7)
     # apply RandAugment given 0.5 probability
-    apply_ra = fn.random.coin_flip(probability=0.5, dtype=types.BOOL)
-    if apply_ra:
-        video = rand_augment.rand_augment(video, shape=[224, 224], n=4, m=7)
+    # apply_ra = fn.random.coin_flip(probability=0.5, dtype=types.BOOL)
+    # if apply_ra:
+    #     video = rand_augment.rand_augment(video, shape=[224, 224], n=4, m=7)
 
     # (1/255.0) scaling and normalization in one step.
     video = fn.crop_mirror_normalize(
@@ -47,25 +55,25 @@ def apply_augmentations(video):
     )
 
     # random erasing (p=0.25)
-    apply_erasing = fn.random.coin_flip(probability=0.25, dtype=types.BOOL)
-    if apply_erasing:
+    # apply_erasing = fn.random.coin_flip(probability=0.25, dtype=types.BOOL)
+    # if apply_erasing:
 
-        # top left corner of the erasure rectangle is uniformly sampled from 
-        # the image
-        # shape=[2] means we want to sample 2 values (for x and y coordinates)
-        anchor = fn.random.uniform(range=[0.0, 1.0], shape=[2])
+    #     # top left corner of the erasure rectangle is uniformly sampled from 
+    #     # the image
+    #     # shape=[2] means we want to sample 2 values (for x and y coordinates)
+    #     anchor = fn.random.uniform(range=[0.0, 1.0], shape=[2])
 
-        # size of the erased region is between 2% to 33% of the original image
-        shape  = fn.random.uniform(range=[0.02, 0.33], shape=[2])
+    #     # size of the erased region is between 2% to 33% of the original image
+    #     shape  = fn.random.uniform(range=[0.02, 0.33], shape=[2])
         
-        video = fn.erase(
-            video,
-            anchor=anchor,
-            shape=shape,
-            axes=[1, 2], # erase in the H and W dimensions
-            normalized=True, # the anchor and shape are (ratios) normalized to [0.0, 1.0], rather than absolute pixel counts
-            fill_value=0.0 # Will fill with 0, black
-        )
+    #     video = fn.erase(
+    #         video,
+    #         anchor=anchor,
+    #         shape=shape,
+    #         axes=[1, 2], # erase in the H and W dimensions
+    #         normalized=True, # the anchor and shape are (ratios) normalized to [0.0, 1.0], rather than absolute pixel counts
+    #         fill_value=0.0 # Will fill with 0, black
+    #     )
 
     # permute from (T, H, W, C) to FCHW which aligns with PyTorch's (T, C, H, W) expectation.
     video = fn.transpose(video, perm=[0, 3, 1, 2])
@@ -109,23 +117,26 @@ def kinetics_webdataset_pipeline(tar_files, index_files, sequence_length=16, tem
     temp_rand_ratio = fn.random.uniform(range=[0.0, 1.0])
     start_frame = fn.cast(
         temp_rand_ratio * fn.cast(max_start, dtype=types.FLOAT),
-        dtype=types.INT64
+        dtype=types.INT32
     )
+
+    start_frame = fn.squeeze(start_frame, axes=[0])
 
     # Decode the video dynamically using NVDEC
     # device="mixed" means the CPU handles the byte-stream, but the GPU handles the decoding
     video = fn.decoders.video(
         video_bytes,
-        device="mixed", 
+        device="mixed", # video tensors on gpu
         sequence_length=sequence_length,
         stride=temporal_stride,
         pad_mode='repeat', # Repeat the last valid frame for padding
-        start_frame=start_frame,
+        # start_frame=start_frame,
     )
     
     # parse the label back to an INT32 tensor
     # fn.reinterpret casts the raw bytes we packed in Step 1 back into numbers
     label = fn.reinterpret(label_bytes, dtype=types.INT64, shape=[1])
+    label = label.gpu() # moveve the label to gpu
 
     # apply GPU augmentations, 2 repeated augmentation repetition
     aug1 = apply_augmentations(video)
@@ -149,7 +160,7 @@ def create_dali_loader(webdataset_dir, batch_size, num_threads, device_id=0):
         batch_size=batch_size,
         num_threads=num_threads, 
         device_id=device_id,
-        prefetch_queue_depth={"cpu_size": 4, "gpu_size": 8}
+        prefetch_queue_depth={"cpu_size": 14, "gpu_size": 14}
     )
     
     pipe.build()

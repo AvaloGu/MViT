@@ -5,6 +5,13 @@ import webdataset as wds
 import numpy as np
 from vocab import STOI
 
+# it optimizes for sequential io rather than random access, eliminating the bottlenecks 
+# associated with reading thousands of small, individual files from disk.
+# In traditional system, When training, the system must constantly locate, open, and close 
+# these small files, creating massive disk-seeking overhead. WebDataset packs data into large .tar 
+# files (shards) and reads data sequentially, avoids the overhead of file system metadata operations 
+# for every single file
+
 def convert_to_webdataset(csv_path, video_dir, output_dir, prefix="kinetics", max_size=1e9):
     os.makedirs(output_dir, exist_ok=True)
     df = pd.read_csv(csv_path)

@@ -3,7 +3,7 @@ import pandas as pd
 import nvidia.dali.fn as fn
 import nvidia.dali.types as types
 from nvidia.dali import pipeline_def
-from nvidia.dali.plugin.pytorch import DALIGenericIterator
+from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
 from nvidia.dali.auto_aug import rand_augment
 from vocab import STOI 
 
@@ -85,7 +85,7 @@ def apply_augmentations(video):
 # inside the GPU-accelerated data pipeline, enabling you to apply certain transformations 
 # (like RandAugment and Random Erasing)
 @pipeline_def(enable_conditionals=True) # pipeline_def decorator automatically injects batch_size, num_threads, and device_id as required keyword arguments for the pipeline
-def kinetics_video_pipeline(filenames, labels, sequence_length=16, temporal_stride=4):
+def kinetics_video_pipeline(filenames, labels, sequence_length=16, temporal_stride=1):
     # video reader & decoder (executes entirely on GPU), (T, H, W, C)
     video, label = fn.readers.video(
         device="gpu",
@@ -96,7 +96,11 @@ def kinetics_video_pipeline(filenames, labels, sequence_length=16, temporal_stri
         random_shuffle=True,
         initial_fill = 256, # size of the buffer that is used for shuffling, pre-loads this many sequences into a buffer before shuffling begins, larger values gives better randomness but more memory
         pad_sequences=True, # if the video is shorter than the required clip length, it will pad by 0
-        name="loader"
+        name="loader",
+        step=10000,
+        # additional_decode_surfaces=16, # decode surfaces are pre-allocated GPU memory buffers used to hold decoded video frames before they are processed by the rest of the pipeline
+        # prefetch_queue_depth=16, # Specifies the number of batches to be prefetched by the internal Loader
+        # read_ahead=True, # allows the reader to read and decode the next batch of video sequences while the current batch is being processed by the GPU, overlapping I/O and computation to improve throughput
     )
 
     # 2 repeated augmentation reptitions
@@ -114,7 +118,8 @@ def create_dali_loader(filenames, labels, batch_size, num_threads, device_id=0):
         batch_size=batch_size,
         num_threads=num_threads, # controls the size of the CPU thread pool dedicated to this pipeline, DALI still uses CPU threads for orchestrating instructions, try 4-8
         device_id=device_id, # index of the GPU
-        prefetch_queue_depth={"cpu_size": 8, "gpu_size": 8} #  pipeline to use separated queues executor, with buffer queue size 4 for cpu stage and 8 for mixed and gpu stages
+        # prefetch_queue_depth={"cpu_size": 8, "gpu_size": 8}, #  pipeline to use separated queues executor, with buffer queue size 4 for cpu stage and 8 for mixed and gpu stages
+        prefetch_queue_depth=4,
     )
     # our setting for prefetch_queue_depth allows the CPU stage to buffer its results independently of the GPU stage, 
     # which is more effective at hiding the spiky stats. 
@@ -127,7 +132,8 @@ def create_dali_loader(filenames, labels, batch_size, num_threads, device_id=0):
         pipe,
         output_map=["aug1", "aug2", "label"], # output_map must match the order of variables returned in @pipeline_def
         reader_name="loader", # reader_name="loader" syncs the iterator's epoch size with fn.readers.video
-        auto_reset=True # automatically reset the iterator at the end of an epoch
+        auto_reset=True, # automatically reset the iterator at the end of an epoch
+        last_batch_policy=LastBatchPolicy.DROP
     )
     
     return dali_loader

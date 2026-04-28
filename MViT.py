@@ -309,6 +309,8 @@ class MViT(nn.Module):
         # x: (B, C, T, H, W)
         device = x.device
         B, C, T, H, W = x.size()
+        assert (C, T, H, W) == (3, 16, 224, 224), f"unexpected input shape: {(C, T, H, W)}"
+        assert torch.isfinite(x).all(), "non-finite input to model"
 
         # patch extraction and embedding, using overlapping cubes
         # x: (B, 3, 16, 224, 224)
@@ -316,7 +318,7 @@ class MViT(nn.Module):
         x = rearrange(x, 'b d t h w -> b t (h w) d') # (B, T, S, D)
 
         # positional space embedding
-        pos = torch.arange(1, self.space_seq_len, dtype=torch.long, device=device) 
+        pos = torch.arange(1, self.space_seq_len, dtype=torch.long, device=device)
         pos_embd = self.pos_embd(pos) # (S, D)
         x = x + pos_embd # (B, T, S, D)
 
